@@ -76,6 +76,8 @@ kitsRouter.post("/", async (req, res) => {
       parsed.data.companyName || guessCompanyName(parsed.data.companyUrl),
   };
 
+  await Kit.deleteMany({ clerkUserId: userId });
+
   const kit = await Kit.create({
     clerkUserId: userId,
     status: "queued",
