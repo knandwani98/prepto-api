@@ -4,16 +4,25 @@ import { searchInterviewDiscussion } from "../services/search";
 import { generateKit } from "../services/generateKit";
 import type { KitInput, KitResearch } from "../types/kit";
 
-export async function runKitJob(kitId: string) {
+type StoredKit = NonNullable<Awaited<ReturnType<typeof Kit.findById>>>;
+
+async function persist(kitId: string, apply: (kit: StoredKit) => void) {
   const kit = await Kit.findById(kitId);
-  if (!kit) return;
+  if (!kit) return null;
+  apply(kit);
+  await kit.save();
+  return kit;
+}
 
+export async function runKitJob(kitId: string) {
   try {
-    kit.status = "researching";
-    kit.error = undefined;
-    await kit.save();
+    const started = await persist(kitId, (current) => {
+      current.status = "researching";
+      current.error = undefined;
+    });
+    if (!started) return;
 
-    const input = kit.input as KitInput | undefined;
+    const input = started.input as KitInput | undefined;
     if (!input) throw new Error("Kit is missing input");
     const companyName = input.companyName || guessCompanyName(input.companyUrl);
 
@@ -28,25 +37,29 @@ export async function runKitJob(kitId: string) {
       interviewProcessInferred: search.inferred,
     };
 
-    kit.set("research", research);
-    kit.status = "generating";
-    if (!input.companyName) kit.set("input.companyName", companyName);
-    await kit.save();
+    const researched = await persist(kitId, (current) => {
+      current.set("research", research);
+      current.status = "generating";
+      if (!input.companyName) current.set("input.companyName", companyName);
+    });
+    if (!researched) return;
 
     const generated = await generateKit(
       { ...input, companyName },
       research,
     );
 
-    kit.set("kit", generated);
-    kit.set("input.companyName", generated.companyBrief.name);
-    kit.status = "ready";
-    await kit.save();
+    await persist(kitId, (current) => {
+      current.set("kit", generated);
+      current.set("input.companyName", generated.companyBrief.name);
+      current.status = "ready";
+    });
   } catch (error) {
     const message =
       error instanceof Error ? error.message : "Kit generation failed";
-    kit.status = "failed";
-    kit.error = message.slice(0, 500);
-    await kit.save();
+    await persist(kitId, (current) => {
+      current.status = "failed";
+      current.error = message.slice(0, 500);
+    });
   }
 }
