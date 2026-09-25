@@ -11,6 +11,16 @@ import type { GeneratedKit, KitInput, KitResearch, RegenerableSection } from "..
 export const kitsRouter = Router();
 
 const MAX_PINNED_KITS = 5;
+const LIST_PAGE_SIZE = 25;
+const LIST_PAGE_MAX = 50;
+
+const listItemProjection = {
+  status: 1,
+  pinnedAt: 1,
+  createdAt: 1,
+  companyName: { $ifNull: ["$kit.companyBrief.name", "$input.companyName"] },
+  roleTitle: "$kit.roleBreakdown.title",
+} as const;
 
 const createSchema = z.object({
   jobDescription: z.string().trim().min(50).max(20000),
@@ -31,18 +41,72 @@ const regenerateSchema = z.object({
   instruction: z.string().trim().max(2000).optional(),
 });
 
-const rateBuckets = new Map<string, { count: number; resetAt: number }>();
+const createRateBuckets = new Map<string, { count: number; resetAt: number }>();
+const listRateBuckets = new Map<string, { count: number; resetAt: number }>();
 
-function allowCreate(userId: string, max = 8, windowMs = 60 * 60 * 1000) {
+function allowRate(
+  buckets: Map<string, { count: number; resetAt: number }>,
+  key: string,
+  max: number,
+  windowMs: number,
+) {
   const now = Date.now();
-  const bucket = rateBuckets.get(userId);
+  const bucket = buckets.get(key);
   if (!bucket || bucket.resetAt < now) {
-    rateBuckets.set(userId, { count: 1, resetAt: now + windowMs });
+    buckets.set(key, { count: 1, resetAt: now + windowMs });
     return true;
   }
   if (bucket.count >= max) return false;
   bucket.count += 1;
   return true;
+}
+
+function allowCreate(userId: string) {
+  return allowRate(createRateBuckets, userId, 8, 60 * 60 * 1000);
+}
+
+function allowList(userId: string) {
+  return allowRate(listRateBuckets, userId, 60, 60 * 1000);
+}
+
+function parseListLimit(value: unknown) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) return LIST_PAGE_SIZE;
+  return Math.min(Math.max(Math.trunc(parsed), 1), LIST_PAGE_MAX);
+}
+
+function parseListCursor(value: unknown) {
+  if (typeof value !== "string" || !value) return null;
+  const sep = value.lastIndexOf("_");
+  if (sep <= 0) return null;
+  const createdAt = new Date(value.slice(0, sep));
+  const id = value.slice(sep + 1);
+  if (Number.isNaN(createdAt.getTime()) || !mongoose.isValidObjectId(id)) {
+    return null;
+  }
+  return { createdAt, id: new mongoose.Types.ObjectId(id) };
+}
+
+function encodeListCursor(createdAt: Date, id: unknown) {
+  return `${new Date(createdAt).toISOString()}_${String(id)}`;
+}
+
+function serializeListItem(doc: {
+  _id: mongoose.Types.ObjectId;
+  status: string;
+  pinnedAt?: Date | null;
+  createdAt: Date;
+  companyName?: string | null;
+  roleTitle?: string | null;
+}) {
+  return {
+    id: String(doc._id),
+    status: doc.status,
+    pinnedAt: doc.pinnedAt ?? null,
+    createdAt: doc.createdAt,
+    companyName: doc.companyName ?? null,
+    roleTitle: doc.roleTitle ?? null,
+  };
 }
 
 function userIdOf(req: Parameters<typeof getAuth>[0]) {
@@ -89,10 +153,51 @@ kitsRouter.post("/", async (req, res) => {
 
 kitsRouter.get("/", async (req, res) => {
   const userId = userIdOf(req);
-  const kits = await Kit.find({ clerkUserId: userId })
-    .select("-research")
-    .sort({ createdAt: -1 });
-  res.json(kits.map((kit) => kit.toJSON()));
+  if (!allowList(userId)) {
+    res.status(429).json({ error: "Too many kit list requests. Try again shortly." });
+    return;
+  }
+
+  const limit = parseListLimit(req.query.limit);
+  const cursor = parseListCursor(req.query.cursor);
+  const unpinnedMatch: Record<string, unknown> = {
+    clerkUserId: userId,
+    pinnedAt: null,
+  };
+
+  if (cursor) {
+    unpinnedMatch.$or = [
+      { createdAt: { $lt: cursor.createdAt } },
+      { createdAt: cursor.createdAt, _id: { $lt: cursor.id } },
+    ];
+  }
+
+  const [pinnedDocs, kitDocs] = await Promise.all([
+    cursor
+      ? Promise.resolve([])
+      : Kit.aggregate([
+          { $match: { clerkUserId: userId, pinnedAt: { $ne: null } } },
+          { $sort: { pinnedAt: -1 } },
+          { $limit: MAX_PINNED_KITS },
+          { $project: listItemProjection },
+        ]),
+    Kit.aggregate([
+      { $match: unpinnedMatch },
+      { $sort: { createdAt: -1, _id: -1 } },
+      { $limit: limit + 1 },
+      { $project: listItemProjection },
+    ]),
+  ]);
+
+  const hasMore = kitDocs.length > limit;
+  const page = hasMore ? kitDocs.slice(0, limit) : kitDocs;
+  const last = page[page.length - 1];
+
+  res.json({
+    pinned: pinnedDocs.map(serializeListItem),
+    kits: page.map(serializeListItem),
+    nextCursor: hasMore && last ? encodeListCursor(last.createdAt, last._id) : null,
+  });
 });
 
 kitsRouter.get("/:id", async (req, res) => {
