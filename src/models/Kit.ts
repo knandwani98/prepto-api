@@ -44,6 +44,8 @@ const kitSchema = new Schema(
   { timestamps: true },
 );
 
+kitSchema.index({ clerkUserId: 1, pinnedAt: 1, createdAt: -1, _id: -1 });
+
 kitSchema.set("toJSON", {
   virtuals: true,
   versionKey: false,

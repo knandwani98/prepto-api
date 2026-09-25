@@ -37,5 +37,5 @@ app.use(
 
 await connectDb();
 app.listen(env.PORT, "0.0.0.0", () => {
-  console.log(`Prepto API listening on ${env.PORT}`);
+  console.log(`Prepto AI API listening on ${env.PORT}`);
 });
